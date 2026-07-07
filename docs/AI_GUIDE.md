@@ -2,7 +2,6 @@
 
 > Cel: szybkie, jednoznaczne instrukcje jak **skonsumować pakiet w nowym projekcie** i jak **dodać nowy `ChunkableTask`**, bez czytania całego źródła.
 > Pełny opis API (parametry, zachowanie brzegowe) żyje w **PHPDoc** przy każdej klasie/metodzie w `src/` — ten dokument tego nie duplikuje, tylko mapuje "co gdzie" i wypisuje reguły niezmienne.
-> Historia ekstrakcji z app-deine: [`../../../docs/reports/BATCH_ORCHESTRATOR_TECHNICAL.md`](../../../docs/reports/BATCH_ORCHESTRATOR_TECHNICAL.md), [`../../../docs/reports/CHUNKING_ARCHITECTURE.md`](../../../docs/reports/CHUNKING_ARCHITECTURE.md).
 
 ## TL;DR — założenia
 
@@ -35,7 +34,7 @@ $orchestrator->dispatch($task)                         // BatchProcessOrchestrat
 1. **Klasa z `getChunkJobClass()` MUSI przyjmować payload chunku jako jedyny argument konstruktora** i używać `Illuminate\Bus\Batchable`, żeby móc sprawdzić `$this->batch()?->cancelled()`.
 2. **`onBatchFinished`/`onBatchFailed` wywoła się dokładnie raz** — nie zakładaj retry na tym poziomie; logikę retry/idempotencji trzeba wbudować w merge/finalizację.
 3. **`incrementChunkProgress($totalChunks)` musi dostać tę samą wartość `$totalChunks` przy każdym wywołaniu w ramach jednego batcha** — inaczej procent się rozjedzie (dzielenie przez inną liczbę za każdym razem).
-4. **Merge/finalizacja NIE dziedziczy z `Batchable`** (to osobny, samodzielny job) — musi mieć własny `failed(Throwable $e)`, inaczej wyjątek ginie cicho w `failed_jobs`, a progres wisi na etapie przed 100%. (Wzorzec: `MergePdfChunksJob` w app-deine.)
+4. **Merge/finalizacja NIE dziedziczy z `Batchable`** (to osobny, samodzielny job) — musi mieć własny `failed(Throwable $e)`, inaczej wyjątek ginie cicho w `failed_jobs`, a progres wisi na etapie przed 100%.
 5. **Klasa hosta traita `HasBatchProgress` musi mieć `getKey()`** (Eloquent ma to natywnie; dla nie-Eloquent klas dopisz metodę zwracającą stabilny identyfikator).
 6. **Zmieniając `progressKeyPrefix()` na już działającym modelu — nie zmieniaj go bez migracji danych**, bo zmienia to nazwy kluczy Redis i traci się dostęp do już zapisanego postępu (nieszkodliwe, bo to tylko cache z TTL, ale UI pokaże "brak postępu" do czasu następnego zapisu).
 
@@ -65,15 +64,10 @@ $orchestrator->dispatch($task)                         // BatchProcessOrchestrat
 4. **Dispatch**: `app(BatchProcessOrchestrator::class)->dispatch(new MyTask($record))` — zwraca `$batchId`, zapisz go jeśli chcesz później `Bus::findBatch($batchId)?->cancel()`.
 5. Model/rekord domenowy: `use HasBatchProgress;` + w razie retrofitu na istniejący model, nadpisz `progressKeyPrefix()` zwracając stary prefiks kluczy (patrz reguła #6) i `onProgressUpdated()` żeby wybroadcastować własny event.
 
-## Instalacja poza monorepo app-deine
+## Instalacja
 
-```json
-"repositories": [
-    { "type": "vcs", "url": "git@gitlab.com:veritas-group/laravel-batch-orchestrator.git" }
-],
-"require": {
-    "kamz8/laravel-batch-orchestrator": "^1.0"
-}
+```bash
+composer require kamz8/laravel-batch-orchestrator
 ```
 Wymaga tabeli `job_batches` (`php artisan queue:batches-table` + migracja) i queue connection wspierającego batching. Config publikowany tagiem `batch-orchestrator-config` (`php artisan vendor:publish --tag=batch-orchestrator-config`).
 
