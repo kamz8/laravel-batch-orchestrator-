@@ -25,9 +25,15 @@
 ```
 $orchestrator->dispatch($task)                         // BatchProcessOrchestrator::dispatch()
   └─ Bus::batch([ChunkJob × N])  → onQueue($task->queue())     chunki: incrementChunkProgress() → 0–80 %
-       ├─ then()  → $task->onBatchFinished($batchId)     // np. dispatch mergeJob   → setProgress(85→95) → 100%
-       └─ catch() → $task->onBatchFailed($exception)     // np. markFailed() + purge chunków
+       ├─ then()  → cleanup → BatchOrchestrationFinished → $task->onBatchFinished($batchId)  // np. dispatch mergeJob → setProgress(85→95) → 100%
+       └─ catch() → cleanup → BatchOrchestrationFailed   → $task->onBatchFailed($exception)  // np. markFailed() + purge chunków
+  → BatchOrchestrationStarted   (zaraz po dispatch(), z prawdziwym batchId)
 ```
+
+Pakiet dodatkowo dispatchuje eventy Laravela w tych punktach (i przy
+`setProgress()`/`incrementChunkProgress()`/buforowaniu payloadów) — patrz
+[`docs/LIFECYCLE_EVENTS.md`](LIFECYCLE_EVENTS.md) po pełną kolejność, tabelę
+eventów i przykłady listenerów.
 
 ## ⛔ Reguły niezmienne (NIE łamać)
 
@@ -90,3 +96,4 @@ wystarczy sam generator, a kiedy potrzebne jest `ShouldBufferPayloads`).
 - [ ] Merge/finalizacja: **nie** `Batchable`, ma `failed()` (reguła #4).
 - [ ] Model domenowy: `use HasBatchProgress` (+ ew. `progressKeyPrefix()`/`onProgressUpdated()`).
 - [ ] Test feature: dispatch przez `BatchProcessOrchestrator`, assert na `onBatchFinished`/`onBatchFailed` (wzorzec: `tests/Feature/BatchProcessOrchestratorTest.php`).
+- [ ] (Opcjonalnie) Listener na eventy cyklu życia (`BatchOrchestrationFailed`, `BatchProgressUpdated` itd.) — patrz [`docs/LIFECYCLE_EVENTS.md`](LIFECYCLE_EVENTS.md); nie wymagane, pakiet działa identycznie bez żadnych listenerów.

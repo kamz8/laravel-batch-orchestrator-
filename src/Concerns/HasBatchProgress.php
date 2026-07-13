@@ -2,7 +2,9 @@
 
 namespace Kamz8\BatchOrchestrator\Concerns;
 
+use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Redis;
+use Kamz8\BatchOrchestrator\Events\BatchProgressUpdated;
 
 /**
  * Adds Redis-backed percent progress tracking to any class exposing a
@@ -27,8 +29,7 @@ trait HasBatchProgress
      */
     public function setProgress(int $percent): void
     {
-        Redis::setex($this->progressKey(), $this->progressTtl(), max(0, min(100, $percent)));
-        $this->onProgressUpdated();
+        $this->writeProgress(max(0, min(100, $percent)), 'set');
     }
 
     /**
@@ -50,7 +51,8 @@ trait HasBatchProgress
         $completed = Redis::incr($this->chunksCompletedKey());
         Redis::expire($this->chunksCompletedKey(), $this->progressTtl());
 
-        $this->setProgress((int) round(($completed / max(1, $totalChunks)) * 80));
+        $percent = max(0, min(100, (int) round(($completed / max(1, $totalChunks)) * 80)));
+        $this->writeProgress($percent, 'increment');
     }
 
     /**
@@ -81,6 +83,38 @@ trait HasBatchProgress
     protected function onProgressUpdated(): void
     {
         //
+    }
+
+    /**
+     * Persist `$percent` under `$this->progressKey()`, dispatch
+     * {@see \Kamz8\BatchOrchestrator\Events\BatchProgressUpdated}, then invoke
+     * {@see self::onProgressUpdated()} — in that order, for both
+     * {@see self::setProgress()} and {@see self::incrementChunkProgress()}.
+     */
+    private function writeProgress(int $percent, string $updateType): void
+    {
+        Redis::setex($this->progressKey(), $this->progressTtl(), $percent);
+
+        Event::dispatch(new BatchProgressUpdated(
+            $this->progressSubjectKey(),
+            $this->progressKeyPrefix(),
+            $percent,
+            null,
+            $updateType,
+        ));
+
+        $this->onProgressUpdated();
+    }
+
+    /**
+     * Stable string identifier of this progress-tracked subject, used on
+     * {@see \Kamz8\BatchOrchestrator\Events\BatchProgressUpdated} instead of
+     * passing the host object/model itself. Override if `getKey()` is not
+     * suitable as an event-facing identifier.
+     */
+    protected function progressSubjectKey(): string
+    {
+        return (string) $this->getKey();
     }
 
     /**
