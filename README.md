@@ -4,8 +4,10 @@ Dynamic chunking and orchestration of Laravel `Bus::batch()` for long-running jo
 
 ## Requirements
 
-- PHP `^8.2` or `^8.3`
-- Laravel `^10.0` or `^11.0` (`illuminate/bus`, `illuminate/support`)
+- PHP `^8.2`, `^8.3`, or `^8.4`
+- Laravel `^10.0`, `^11.0`, `^12.0`, or `^13.0` (`illuminate/bus`, `illuminate/support`)
+
+See [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) for the full PHP × Laravel support matrix and known exceptions.
 
 ## Installation
 

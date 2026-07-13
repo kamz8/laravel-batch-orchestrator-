@@ -1,129 +1,134 @@
-# Buforowane payloady i strumieniowanie (`ShouldBufferPayloads`)
+# Buffered payloads and streaming (`ShouldBufferPayloads`)
 
-> Ten dokument odpowiada precyzyjnie na pytanie: "czy mogę strumieniować duże
-> źródło danych (np. plik XML) przez `getChunks()` bez trzymania całości w
-> pamięci, i co dokładnie robi `ShouldBufferPayloads`?". Wszystkie twierdzenia
-> poniżej są oparte na kodzie w `src/`, nie na domysłach — ścieżki i numery
-> linii wskazują dokładnie gdzie to się dzieje.
+> This document answers precisely: "can I stream a large data source (e.g. an
+> XML file) through `getChunks()` without holding the whole thing in memory,
+> and what exactly does `ShouldBufferPayloads` do?" Every claim below is based
+> on the code in `src/`, not guesswork — paths and line numbers point exactly
+> to where it happens.
 
 ## TL;DR
 
-1. `getChunks(): iterable` **może** być generatorem. Orchestrator konsumuje go
-   przez zwykłe `foreach`, nigdy nie robi `iterator_to_array()`.
-2. Zbuforowany payload trafia **do Redis** (`Illuminate\Support\Facades\Redis::setex()`),
-   nie na dysk (`Storage`) i nie do generycznej fasady `Cache`. TTL i prefiks
-   klucza są konfigurowalne w `config/batch-orchestrator.php`.
-3. Buforowanie jest **w pełni automatyczne po stronie orchestratora**. Task
-   implementuje `ShouldBufferPayloads` i yielduje surowe dane tak samo jak bez
-   buforowania — nie wywołuje żadnej metody "zapisz payload". Orchestrator sam
-   robi `Redis::setex()` i podmienia argument konstruktora chunk joba na
-   `BufferedPayloadReference`. Chunk job musi jedynie wywołać
-   `resolvePayload()` na starcie `handle()`.
+1. `getChunks(): iterable` **can** be a generator. The orchestrator consumes
+   it via a plain `foreach`, never `iterator_to_array()`.
+2. A buffered payload lands **in Redis** (`Illuminate\Support\Facades\Redis::setex()`),
+   not on disk (`Storage`) and not in the generic `Cache` facade. TTL and key
+   prefix are configurable in `config/batch-orchestrator.php`.
+3. Buffering is **fully automatic on the orchestrator's side**. The task
+   implements `ShouldBufferPayloads` and yields raw data exactly as it would
+   without buffering — it never calls a "store this payload" method itself.
+   The orchestrator does the `Redis::setex()` and swaps the chunk job's
+   constructor argument for a `BufferedPayloadReference`. The chunk job only
+   needs to call `resolvePayload()` at the start of `handle()`.
 
-## Co się dzieje krok po kroku (`BaseOrchestrator::dispatch()`)
+## What happens step by step (`BaseOrchestrator::dispatch()`)
 
-Plik: `src/Services/BaseOrchestrator.php`
+File: `src/Services/BaseOrchestrator.php`
 
 ```php
-$chunks = $task->getChunks();                          // (1) generator albo array — nic jeszcze nie jest konsumowane
+$chunks = $task->getChunks();                          // (1) generator or array — nothing consumed yet
 
-foreach ($chunks as $index => $chunkData) {             // (2) leniwa konsumpcja — jeden element na iterację
+foreach ($chunks as $index => $chunkData) {             // (2) lazy consumption — one element per iteration
     $payload = $chunkData;
 
     if ($task instanceof ShouldBufferPayloads) {
         $key = sprintf('%s:%s:%s', $task->payloadKeyPrefix(), $batchKey, $index);
-        Redis::setex($key, $task->payloadTtl(), serialize($chunkData));   // (3) surowe dane lecą do Redis i mogą zostać zwolnione z PHP
-        $payload = new BufferedPayloadReference($key, $batchKey, $index); // (4) job dostaje tylko lekki wskaźnik
+        Redis::setex($key, $task->payloadTtl(), serialize($chunkData));   // (3) raw data goes to Redis and can be freed from PHP
+        $payload = new BufferedPayloadReference($key, $batchKey, $index); // (4) the job gets only a lightweight pointer
     }
 
     $jobBuffer[] = new $jobClass($payload);
 
-    if (count($jobBuffer) >= $flushSize) {               // (5) domyślnie 100 — patrz sekcja "Czego to NIE robi"
+    if (count($jobBuffer) >= $flushSize) {               // (5) 100 by default — see "What this does NOT do"
         $pendingBatch->add($jobBuffer);
         $jobBuffer = [];
     }
 }
 ```
 
-Chunk job (musi mieć `use InteractsWithBufferedPayload;`):
+Chunk job (must `use InteractsWithBufferedPayload;`):
 
 ```php
 public function handle(): void
 {
-    $data = $this->resolvePayload($this->chunkData); // zwraca oryginał (non-buffered) albo odczytuje+unserializuje z Redis
-    // ... normalna logika na $data
+    $data = $this->resolvePayload($this->chunkData); // returns the original (non-buffered) or reads+unserializes from Redis
+    // ... normal logic on $data
 }
 ```
 
 `resolvePayload()` (`src/Concerns/InteractsWithBufferedPayload.php`):
-- jeśli argument nie jest `BufferedPayloadReference` → zwraca go bez zmian (ta sama klasa joba działa buforowana i niebuforowana),
-- jeśli jest → `Redis::get($key)`, `unserialize()`; brakujący klucz lub zepsute dane → `RuntimeException`, co ląduje w `onBatchFailed()` przez normalny mechanizm batcha.
+- if the argument isn't a `BufferedPayloadReference` → returns it unchanged (the same job class works buffered and non-buffered),
+- if it is → `Redis::get($key)`, `unserialize()`; a missing key or corrupted data → `RuntimeException`, which lands in `onBatchFailed()` through the batch's normal mechanism.
 
-## Gdzie to jest konfigurowalne
+## Where this is configurable
 
-Plik: `config/batch-orchestrator.php`
+File: `config/batch-orchestrator.php`
 
-| Klucz | Domyślna wartość | Co robi |
+| Key | Default | What it does |
 |---|---|---|
-| `payload_ttl` | `14400` (4h) | TTL klucza Redis; musi pokrywać cały cykl życia chunk joba **łącznie z ewentualnymi retry** — zbyt krótki TTL = `RuntimeException` przy retry po wygaśnięciu klucza. |
-| `payload_key_prefix` | `batch-orchestrator:payload` | Prefiks klucza Redis (`{prefix}:{batchKey}:{index}`). |
-| `payload_chunk_flush_size` | `100` | Ile obiektów chunk joba czeka w PHP-owej tablicy `$jobBuffer` zanim trafi do `$pendingBatch->add()`. Patrz zastrzeżenie niżej — to NIE jest budżet pamięci na cały batch. |
+| `payload_ttl` | `14400` (4h) | The Redis key's TTL; must cover the chunk job's entire lifecycle **including any retries** — too short a TTL means a `RuntimeException` on retry after the key expires. |
+| `payload_key_prefix` | `batch-orchestrator:payload` | The Redis key prefix (`{prefix}:{batchKey}:{index}`). |
+| `payload_chunk_flush_size` | `100` | How many chunk-job objects wait in the PHP array `$jobBuffer` before being handed to `$pendingBatch->add()`. See the caveat below — this is NOT a memory budget for the whole batch. |
 
-Task zwykle nie nadpisuje tych metod ręcznie — `use BuffersPayloads;` czyta je
-z configu. Nadpisz `payloadTtl()`/`payloadKeyPrefix()` na tasku tylko gdy
-konkretny workload potrzebuje dłuższego okna retry albo izolowanej przestrzeni
-kluczy Redis.
+A task usually doesn't override these methods manually — `use BuffersPayloads;`
+reads them from config. Only override `payloadTtl()`/`payloadKeyPrefix()` on
+the task itself when a specific workload needs a longer retry window or an
+isolated Redis key space.
 
-## Czego to NIE robi (ważne dla poprawnego planu)
+## What this does NOT do (important for a correct plan)
 
-`Illuminate\Bus\Batch` musi znać **całkowitą liczbę jobów** żeby śledzić
-postęp (`$batch->totalJobs`) — więc wszystkie N obiektów chunk joba i tak
-zostają zbudowane i przekazane do `PendingBatch` przed `dispatch()`. Generator
-**nie zmniejsza liczby jobów w batchu**. `payload_chunk_flush_size` kontroluje
-tylko rozmiar pomocniczej tablicy `$jobBuffer` między kolejnymi wywołaniami
-`add()` — nie jest to "okno pamięci" całego batcha, bo `PendingBatch` i tak
-trzyma referencje do wszystkich dodanych jobów aż do `dispatch()`.
+`Illuminate\Bus\Batch` needs to know the **total number of jobs** to track
+progress (`$batch->totalJobs`) — so all N chunk-job objects still get built
+and handed to `PendingBatch` before `dispatch()`. A generator **does not
+reduce the number of jobs in the batch**. `payload_chunk_flush_size` only
+controls the size of the helper array `$jobBuffer` between successive
+`add()` calls — it is not a "memory window" for the whole batch, since
+`PendingBatch` still holds references to every added job until `dispatch()`.
 
-To, co faktycznie daje strumieniowanie i buforowanie:
+What streaming and buffering actually give you:
 
-- **Źródło danych nigdy nie jest materializowane w całości** — czytasz/grupujesz/yieldujesz na bieżąco (np. `XMLReader` czytający węzeł po węźle), więc plik XML na 500 MB nie ląduje w jednym dużym PHP-owym array.
-- **Payload każdego joba jest mały** — z `ShouldBufferPayloads` job trzyma `BufferedPayloadReference` (string + opcjonalny int), a nie pełny wycinek danych. To sprawia, że pamięć zajęta przez wszystkie N obiektów jobów w `PendingBatch` jest rzędu N × kilkadziesiąt bajtów, a nie N × rozmiar chunku.
+- **The data source is never materialized in full** — you read/group/yield
+  on the fly (e.g. an `XMLReader` reading node by node), so a 500 MB XML file
+  never lands in one big PHP array.
+- **Each job's payload is small** — with `ShouldBufferPayloads`, a job holds a
+  `BufferedPayloadReference` (a string + an optional int), not a full slice
+  of data. That makes the memory used by all N job objects in `PendingBatch`
+  on the order of N × a few dozen bytes, not N × the chunk's size.
 
-Innymi słowy: liczba jobów pozostaje N (to nieuniknione dla `Bus::batch`),
-ale ich "waga" w pamięci procesu dispatchującego oraz w kolejce (payload w
-`jobs`/`failed_jobs`) jest drastycznie mniejsza, a parser źródła nigdy nie
-trzyma całego zbioru na raz.
+In other words: the number of jobs stays N (unavoidable for `Bus::batch`),
+but their "weight" in the dispatching process's memory and in the queue
+(payload in `jobs`/`failed_jobs`) is drastically smaller, and the source
+parser never holds the whole dataset at once.
 
-## Pułapka: task nie może trzymać generatora jako property
+## Trap: a task cannot hold a generator as a property
 
-Zamknięcia (`Closure`) przekazane do `->then()`/`->catch()` w
-`BaseOrchestrator::dispatch()` przechwytują `$callbackTask` przez `use (...)`.
-Dla realnej (nie-`sync`) kolejki ten callback jest serializowany razem z
-batchem. Jeśli task implementuje `ShouldBufferPayloads`, orchestrator
-automatycznie tworzy "czystą" kopię tasku bez chunk-source (patrz
-`BaseOrchestrator::taskWithoutBufferedPayloads()`), więc niebezpieczne
-właściwości (np. `Traversable`, `Closure`) są usuwane z kopii używanej w
-callbacku.
+Closures passed to `->then()`/`->catch()` in `BaseOrchestrator::dispatch()`
+capture `$callbackTask` via `use (...)`. For a real (non-`sync`) queue, this
+callback is serialized along with the batch. If the task implements
+`ShouldBufferPayloads`, the orchestrator automatically builds a "clean" copy
+of the task without the chunk source (see
+`BaseOrchestrator::taskWithoutBufferedPayloads()`), so unsafe properties
+(e.g. `Traversable`, `Closure`) are stripped from the copy used in the
+callback.
 
-**Dla tasków bez `ShouldBufferPayloads` tego zabezpieczenia nie ma.** Zasada:
-nie trzymaj generatora/iteratora jako properties na obiekcie tasku. Buduj go
-na bieżąco wewnątrz `getChunks()` z niezmiennych, serializowalnych danych
-(np. ścieżka do pliku przekazana w konstruktorze), tak jak robi to
-`FakeGeneratorChunkableTask` w testach — konstruktor trzyma tylko skalarne
-`count`/`jobClass`/`queueName`, generator jest tworzony od nowa przy każdym
-wywołaniu `getChunks()`.
+**Tasks without `ShouldBufferPayloads` don't get this protection.** Rule: do
+not hold a generator/iterator as a property on the task object. Build it
+on the fly inside `getChunks()` from immutable, serializable data (e.g. a
+file path passed in the constructor), the way `FakeGeneratorChunkableTask`
+does in the tests — the constructor holds only scalar
+`count`/`jobClass`/`queueName`, and the generator is built fresh on every
+`getChunks()` call.
 
-## Retry i TTL — zastrzeżenie z kontraktu
+## Retry and TTL — a contract caveat
 
-Pełny opis w PHPDoc `src/Contracts/ShouldBufferPayloads.php`: kolejkowany
-retry może odczytać payload tylko dopóki klucz Redis istnieje. TTL musi być
-dłuższy niż maksymalne opóźnienie kolejki + okno retry + spodziewany czas
-trwania całego batcha. Brakujący lub zepsuty klucz jest traktowany jak błąd
-zadania (`RuntimeException`), więc batch poprawnie przechodzi w
-`onBatchFailed()` zamiast ciszej awarii.
+Full description in the PHPDoc of `src/Contracts/ShouldBufferPayloads.php`:
+a queued retry can only read the payload as long as the Redis key still
+exists. The TTL must be longer than the maximum queue delay + retry window +
+expected duration of the whole batch. A missing or corrupted key is treated
+as a job error (`RuntimeException`), so the batch correctly transitions into
+`onBatchFailed()` instead of failing silently.
 
-## Zobacz też
+## See also
 
-- `docs/use-cases/streaming-xml-import.md` — pełny przykład: duży plik XML → grupowanie N rekordów → `ShouldBufferPayloads` → chunk job → merge job.
-- `docs/use-cases/small-generator-no-buffering.md` — kiedy generator wystarczy sam, bez buforowania w Redis.
-- `docs/AI_GUIDE.md` — ogólne reguły niezmienne pakietu (progres, merge job, `getKey()` itd.).
+- `docs/use-cases/streaming-xml-import.md` — a full example: a large XML file → grouping N records → `ShouldBufferPayloads` → chunk job → merge job.
+- `docs/use-cases/small-generator-no-buffering.md` — when a plain generator is enough, without buffering in Redis.
+- `docs/AI_GUIDE.md` — the package's general invariant rules (progress, merge job, `getKey()`, etc.).

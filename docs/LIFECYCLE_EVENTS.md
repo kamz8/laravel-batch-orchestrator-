@@ -1,62 +1,72 @@
-# Eventy cyklu życia (`src/Events/`)
+# Lifecycle events (`src/Events/`)
 
-> Ten dokument opisuje 8 eventów, które pakiet **dispatchuje** (przez
-> `Illuminate\Support\Facades\Event::dispatch()`) w kluczowych momentach
-> orchestracji batcha i operacji na buforowanych payloadach. Pakiet tylko
-> emituje — nie rejestruje żadnych listenerów, nie broadcastuje
-> (`ShouldBroadcast`) i nie kolejkuje (`ShouldQueue`) ich. Konsument sam
-> decyduje, czy je zaloguje, przerobi na własny broadcastowany event, zaktualizuje
-> UI, czy zignoruje. Pełny opis pól/gwarancji każdego eventu żyje w PHPDoc przy
-> klasie w `src/Events/` — ten dokument tego nie duplikuje, tylko pokazuje
-> kolejność i sposób integracji.
+> This document describes the 8 events the package **dispatches** (via
+> `Illuminate\Support\Facades\Event::dispatch()`) at key points of batch
+> orchestration and buffered-payload operations. The package only emits them —
+> it registers no listeners, never broadcasts (`ShouldBroadcast`), and never
+> queues (`ShouldQueue`) them. It's up to the consumer to decide whether to
+> log them, turn them into their own broadcasted event, update a UI, or
+> ignore them. The full field/guarantee description of each event lives in
+> PHPDoc on the class in `src/Events/` — this document doesn't duplicate that,
+> it only shows the order and how to integrate.
 
-## Diagram cyklu życia
+## Lifecycle diagram
 
 ```
 dispatch()
-  → payload stored × N                    (BufferedPayloadStored, tylko ShouldBufferPayloads)
+  → payload stored × N                    (BufferedPayloadStored, ShouldBufferPayloads only)
   → Laravel Batch dispatched
-  → BatchOrchestrationStarted              (dopiero po dispatch(), z prawdziwym batchId)
-  → (w chunk jobach) BufferedPayloadResolved × N / BufferedPayloadResolutionFailed
-  → BatchProgressUpdated × N               (z setProgress()/incrementChunkProgress() na modelu)
+  → BatchOrchestrationStarted              (only after dispatch(), with the real batchId)
+  → (in chunk jobs) BufferedPayloadResolved × N / BufferedPayloadResolutionFailed
+  → BatchProgressUpdated × N               (from setProgress()/incrementChunkProgress() on the model)
   ├─ success:
-  │    → payload cleanup (partiami)
-  │    → BufferedPayloadCleanupCompleted    (tylko ShouldBufferPayloads)
+  │    → payload cleanup (in batches)
+  │    → BufferedPayloadCleanupCompleted    (ShouldBufferPayloads only)
   │    → BatchOrchestrationFinished
   │    → ChunkableTask::onBatchFinished()
   └─ failure:
-       → payload cleanup (partiami)
-       → BufferedPayloadCleanupCompleted    (tylko ShouldBufferPayloads)
+       → payload cleanup (in batches)
+       → BufferedPayloadCleanupCompleted    (ShouldBufferPayloads only)
        → BatchOrchestrationFailed
        → ChunkableTask::onBatchFailed()
 ```
 
-**Zastrzeżenie (queue `sync`):** przy `queue.default = sync` cały batch —
-łącznie z gałęzią sukcesu/porażki i `onBatchFinished()`/`onBatchFailed()` —
-wykonuje się **wewnątrz** wywołania `->dispatch()` w `Bus::batch(...)->dispatch()`.
-`BatchOrchestrationStarted` jest emitowany dopiero **po** tym wywołaniu (bo
-dopiero wtedy istnieje prawdziwy `batchId`), więc w trybie sync obserwujesz go
-**po** zdarzeniach finalizujących. Na realnej (asynchronicznej) kolejce
-`dispatch()` wraca zaraz po zapisaniu batcha i wypchnięciu jobów do kolejki —
-`Started` poprzedza wykonanie chunków, tak jak nazwa sugeruje. Jedyna
-gwarantowana kolejność niezależnie od typu kolejki to pod-sekwencja
-finalizacji: `cleanup → BufferedPayloadCleanupCompleted → Finished/Failed →
-onBatchFinished()/onBatchFailed()`.
+**Caveat (`sync` queue):** with `queue.default = sync`, the entire batch —
+including the success/failure branch and `onBatchFinished()`/
+`onBatchFailed()` — executes **inside** the `->dispatch()` call in
+`Bus::batch(...)->dispatch()`. `BatchOrchestrationStarted` is only emitted
+**after** that call returns (since only then does a real `batchId` exist), so
+on sync queue you observe it **after** the finalization events. On a real
+(asynchronous) queue, `dispatch()` returns as soon as the batch is persisted
+and jobs are pushed to the queue — `Started` precedes chunk execution, as the
+name implies. The only ordering guaranteed regardless of queue type is the
+finalization sub-sequence: `cleanup → BufferedPayloadCleanupCompleted →
+Finished/Failed → onBatchFinished()/onBatchFailed()`.
 
-## Tabela eventów
+Related framework quirk: on Laravel 10, 12, and 13, a chunk job throwing under
+`queue.default=sync` would otherwise re-throw out of `dispatch()` itself
+*after* `BatchOrchestrationFailed`/`onBatchFailed()` have already fired
+correctly (Laravel 11 alone swallows this internally). `BaseOrchestrator`
+catches that redundant, version-dependent exception so `dispatch()` always
+returns the batch ID rather than throwing — see the "Common Mistakes"
+section in [`docs/AI_GUIDE.md`](AI_GUIDE.md) for why, and
+[`docs/COMPATIBILITY.md`](COMPATIBILITY.md) for the underlying framework
+difference.
 
-| Event | Moment emisji | Najważniejsze dane | Czego event NIE oznacza |
+## Event table
+
+| Event | Emission point | Key data | What the event does NOT mean |
 |---|---|---|---|
-| `BatchOrchestrationStarted` | Zaraz po skutecznym `->dispatch()` Laravel Batcha | `BatchContext` (z prawdziwym `batchId`), `buffered: bool` | Że jakikolwiek chunk job już się wykonał (na kolejce sync może być odwrotnie — patrz zastrzeżenie wyżej) |
-| `BatchOrchestrationFinished` | W callbacku `then()`, po cleanupie payloadów, przed `onBatchFinished()` | `BatchContext` z `batchId` | Zakończenia całego procesu domenowego — merge/finalizacja może nadal trwać |
-| `BatchOrchestrationFailed` | W callbacku `catch()`, po cleanupie payloadów, przed `onBatchFailed()` | `BatchContext`, `exceptionClass`, `message`, `code` | Że wszystkie chunk joby na pewno przestały działać — inne mogły być w locie |
-| `BatchProgressUpdated` | Po każdym udanym zapisie w `HasBatchProgress` (`setProgress()`/`incrementChunkProgress()`), przed `onProgressUpdated()` | `subjectKey` (string, nie model!), `keyPrefix`, `progress`, `previousProgress` (zawsze `null` z tego pakietu), `updateType` (`'set'`\|`'increment'`) | Że to ostatnia zmiana progresu — kolejne joby/kroki mogą jeszcze podbić wartość |
-| `BufferedPayloadStored` | Zaraz po udanym `Redis::setex()` dla jednego chunku | `key`, `batchKey`, `index`, `ttl` | Że chunk job z tym payloadem już został zakolejkowany/wykonany |
-| `BufferedPayloadResolved` | W `resolvePayload()`, po udanym `Redis::get()` + `unserialize()` | `key`, `batchKey`, `index` | Że dalsza logika `handle()` chunk joba się powiedzie |
-| `BufferedPayloadResolutionFailed` | W `resolvePayload()`, tuż przed rzuceniem `RuntimeException` (brak klucza lub zepsute dane) | `key`, `batchKey`, `index`, `reason` | Rozróżnienia dokładnej przyczyny poza czytelnym tekstem `reason` |
-| `BufferedPayloadCleanupCompleted` | Po przejściu całego (partiami) cleanupu Redis, tylko dla `ShouldBufferPayloads` | `BatchContext`, `deletedKeys` (liczba, nie lista kluczy) | Że wszystkie klucze fizycznie zniknęły z Redis — `DEL` na już wygasłym kluczu też się liczy |
+| `BatchOrchestrationStarted` | Right after a successful Laravel Batch `->dispatch()` | `BatchContext` (with the real `batchId`), `buffered: bool` | That any chunk job has already run (on a sync queue it may actually be the reverse — see the caveat above) |
+| `BatchOrchestrationFinished` | In the `then()` callback, after payload cleanup, before `onBatchFinished()` | `BatchContext` with `batchId` | The end of the whole domain process — merge/finalization may still be running |
+| `BatchOrchestrationFailed` | In the `catch()` callback, after payload cleanup, before `onBatchFailed()` | `BatchContext`, `exceptionClass`, `message`, `code` | That every chunk job has definitely stopped running — others may still be in flight |
+| `BatchProgressUpdated` | After every successful write in `HasBatchProgress` (`setProgress()`/`incrementChunkProgress()`), before `onProgressUpdated()` | `subjectKey` (string, not the model!), `keyPrefix`, `progress`, `previousProgress` (always `null` from this package), `updateType` (`'set'`\|`'increment'`) | That this is the last progress change — later jobs/steps may still bump the value |
+| `BufferedPayloadStored` | Right after a successful `Redis::setex()` for one chunk | `key`, `batchKey`, `index`, `ttl` | That the chunk job holding this payload has already been queued/executed |
+| `BufferedPayloadResolved` | In `resolvePayload()`, after a successful `Redis::get()` + `unserialize()` | `key`, `batchKey`, `index` | That the rest of the chunk job's `handle()` logic will succeed |
+| `BufferedPayloadResolutionFailed` | In `resolvePayload()`, right before throwing `RuntimeException` (missing key or corrupted data) | `key`, `batchKey`, `index`, `reason` | Distinguishing the exact cause beyond the human-readable `reason` text |
+| `BufferedPayloadCleanupCompleted` | After the entire (batched) Redis cleanup pass, `ShouldBufferPayloads` only | `BatchContext`, `deletedKeys` (a count, not a list of keys) | That every key has physically disappeared from Redis — `DEL` on an already-expired key still counts |
 
-## Przykład: logowanie błędu orchestracji
+## Example: logging an orchestration failure
 
 ```php
 use Illuminate\Support\Facades\Event;
@@ -73,7 +83,7 @@ Event::listen(BatchOrchestrationFailed::class, function (BatchOrchestrationFaile
 });
 ```
 
-## Przykład: przekucie progresu na własny broadcastowany event domenowy
+## Example: turning progress into your own broadcasted domain event
 
 ```php
 use Illuminate\Support\Facades\Event;
@@ -87,39 +97,40 @@ Event::listen(BatchProgressUpdated::class, function (BatchProgressUpdated $event
 });
 ```
 
-`ProcessProgressChanged` to Twój własny event domenowy (np. `ShouldBroadcastNow`
-na kanale Reverb) — pakiet nic o nim nie wie i nie musi.
+`ProcessProgressChanged` is your own domain event (e.g. `ShouldBroadcastNow`
+on a Reverb channel) — the package knows nothing about it and doesn't need to.
 
-**Ważne:** `BatchOrchestrationFinished` oznacza koniec fazy chunków, a
-niekoniecznie koniec merge/finalizacji domenowej — nie triggeruj z tego eventu
-logiki, która zakłada, że rekord domenowy jest już w 100%/`completed`.
+**Important:** `BatchOrchestrationFinished` marks the end of the chunk phase,
+not necessarily the end of domain-level finalization — don't trigger logic
+from this event that assumes the domain record is already at 100%/`completed`.
 
 ## Common mistakes
 
-- **Nie broadcastuj całego modelu domenowego bezpośrednio z listenera pakietu.**
-  Eventy pakietu celowo niosą tylko `subjectKey`/`BatchContext` — jeśli Twój
-  listener od razu ładuje pełny model i wysyła go po WebSocketach, przemyśl,
-  czy nie chcesz zamiast tego wysłać samego ID i pozwolić klientowi dociągnąć
-  szczegóły.
-- **Nie traktuj `BatchOrchestrationFinished` jako końca merge joba.** To tylko
-  koniec fazy równoległych chunków; merge/finalizacja startuje zwykle z
-  `onBatchFinished()` i może jeszcze trwać długo po tym evencie.
-- **Listenery powinny być idempotentne.** Retry na poziomie kolejki, ręczne
-  ponowne uruchomienie batcha, albo (rzadko) powtórzone dostarczenie eventu nie
-  powinny psuć stanu — nie zakładaj dokładnie jednego wywołania w globalnej
-  skali systemu, tylko w skali jednego batcha.
-- **Listener nie powinien blokować workera ciężką operacją.** Eventy są
-  dispatchowane synchronicznie w tym samym procesie co orchestrator/chunk
-  job/trait — długi listener (np. zapytanie do zewnętrznego API) wydłuża
-  realny czas przetwarzania joba.
-- **Ciężkie reakcje powinny dispatchować własny queued listener albo job.**
-  Jeśli reakcja na event wymaga czegoś kosztownego, zarejestruj queued
-  listener (`ShouldQueue` na listenerze, nie na evencie pakietu) albo
-  dispatchuj z niego osobny job — sam event z pakietu pozostaje lekki i
-  synchroniczny.
+- **Don't broadcast the full domain model directly from a package
+  listener.** The package's events deliberately carry only
+  `subjectKey`/`BatchContext` — if your listener immediately loads the full
+  model and pushes it over WebSockets, consider sending just the ID and
+  letting the client fetch details instead.
+- **Don't treat `BatchOrchestrationFinished` as the end of the merge job.**
+  It's only the end of the parallel chunk phase; merge/finalization usually
+  starts from `onBatchFinished()` and can still be running long after this
+  event.
+- **Listeners should be idempotent.** Queue-level retries, a manual batch
+  re-run, or (rarely) duplicate event delivery should not corrupt state —
+  don't assume exactly-once delivery at the whole-system scale, only within
+  one batch.
+- **A listener should not block the worker with a heavy operation.** Events
+  are dispatched synchronously in the same process as the
+  orchestrator/chunk job/trait — a slow listener (e.g. a call to an external
+  API) extends the real processing time of that job.
+- **Heavy reactions should dispatch their own queued listener or job.** If
+  reacting to an event requires something expensive, register a queued
+  listener (`ShouldQueue` on the listener, not on the package's event) or
+  dispatch a separate job from it — the package's own event stays light and
+  synchronous.
 
-## Zobacz też
+## See also
 
-- `docs/AI_GUIDE.md` — ogólne reguły niezmienne pakietu (progres, merge job, `getKey()` itd.).
-- `docs/BUFFERED_PAYLOADS.md` — mechanika buforowania/strumieniowania, z którą część tych eventów jest ściśle związana.
-- PHPDoc w `src/Events/*.php` i `src/Support/BatchContext.php` — pełny, autorytatywny opis pól i gwarancji każdego eventu.
+- `docs/AI_GUIDE.md` — the package's general invariant rules (progress, merge job, `getKey()`, etc.).
+- `docs/BUFFERED_PAYLOADS.md` — the buffering/streaming mechanics several of these events are tied to.
+- PHPDoc in `src/Events/*.php` and `src/Support/BatchContext.php` — the full, authoritative description of each event's fields and guarantees.
