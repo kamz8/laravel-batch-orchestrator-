@@ -4,7 +4,10 @@ declare(strict_types=1);
 
 namespace Kamz8\BatchOrchestrator\Concerns;
 
+use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Redis;
+use Kamz8\BatchOrchestrator\Events\BufferedPayloadResolutionFailed;
+use Kamz8\BatchOrchestrator\Events\BufferedPayloadResolved;
 use Kamz8\BatchOrchestrator\Support\BufferedPayloadReference;
 use RuntimeException;
 
@@ -29,14 +32,24 @@ trait InteractsWithBufferedPayload
         $serialized = Redis::get($payload->key);
 
         if ($serialized === null) {
+            $reason = 'missing or expired';
+
+            Event::dispatch(new BufferedPayloadResolutionFailed($payload->key, $payload->batchKey, $payload->index, $reason));
+
             throw new RuntimeException("Buffered payload missing or expired in Redis: {$payload->key}");
         }
 
         $resolved = @unserialize((string) $serialized);
 
         if ($resolved === false && $serialized !== serialize(false)) {
+            $reason = 'corrupt payload';
+
+            Event::dispatch(new BufferedPayloadResolutionFailed($payload->key, $payload->batchKey, $payload->index, $reason));
+
             throw new RuntimeException("Buffered payload is corrupt in Redis: {$payload->key}");
         }
+
+        Event::dispatch(new BufferedPayloadResolved($payload->key, $payload->batchKey, $payload->index));
 
         return $resolved;
     }

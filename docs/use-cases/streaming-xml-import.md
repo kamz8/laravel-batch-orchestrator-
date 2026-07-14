@@ -1,17 +1,18 @@
-# Use case: strumieniowy import dużego pliku XML
+# Use case: streaming import of a large XML file
 
-**Problem:** feed produktowy XML, kilkaset MB, kilkaset tysięcy pozycji. Nie
-można wczytać całości do pamięci (`SimpleXMLElement::load()` na całym pliku)
-ani zbudować jednej wielkiej tablicy PHP przed dispatchem batcha.
+**Problem:** a product feed in XML, several hundred MB, several hundred
+thousand items. You can't load the whole thing into memory
+(`SimpleXMLElement::load()` on the entire file) or build one giant PHP array
+before dispatching the batch.
 
-**Rozwiązanie:** `XMLReader` czytający węzeł po węźle wewnątrz generatora w
-`getChunks()`, grupowanie po N produktów na chunk, `ShouldBufferPayloads` żeby
-każdy chunk job dostał tylko lekką referencję do Redis zamiast pełnej paczki
-danych.
+**Solution:** an `XMLReader` reading node by node inside a generator in
+`getChunks()`, grouping N products per chunk, and `ShouldBufferPayloads` so
+each chunk job gets only a lightweight Redis reference instead of the full
+data package.
 
-Pakiet **nie wymaga** własnej implementacji streamingu XML — ten wzorzec
-opiera się wyłącznie na `getChunks(): iterable` będącym generatorem i na
-`ShouldBufferPayloads`. Nic więcej nie trzeba dopisywać w orchestratorze.
+The package **requires no XML-streaming implementation of its own** — this
+pattern relies entirely on `getChunks(): iterable` being a generator and on
+`ShouldBufferPayloads`. Nothing else needs to be added to the orchestrator.
 
 ## 1. Task
 
@@ -22,18 +23,18 @@ use Kamz8\BatchOrchestrator\Contracts\ShouldBufferPayloads;
 
 class ImportProductFeedTask implements ChunkableTask, ShouldBufferPayloads
 {
-    use BuffersPayloads; // domyślny TTL/prefiks z config/batch-orchestrator.php
+    use BuffersPayloads; // default TTL/prefix from config/batch-orchestrator.php
 
     private const int PRODUCTS_PER_CHUNK = 200;
 
     public function __construct(
         private readonly int $feedId,
-        private readonly string $xmlPath, // tylko ścieżka — string, bezpieczny do serializacji
+        private readonly string $xmlPath, // path only — a string, safe to serialize
     ) {}
 
     /**
-     * Generator: czyta plik węzeł po węźle, nigdy nie trzyma całego XML w pamięci.
-     * Yielduje surowe dane co PRODUCTS_PER_CHUNK produktów.
+     * Generator: reads the file node by node, never holds the whole XML in memory.
+     * Yields raw data every PRODUCTS_PER_CHUNK products.
      *
      * @return iterable<int, array<int, array<string, mixed>>>
      */
@@ -58,13 +59,13 @@ class ImportProductFeedTask implements ChunkableTask, ShouldBufferPayloads
             ];
 
             if (count($buffer) >= self::PRODUCTS_PER_CHUNK) {
-                yield $buffer;   // <-- orchestrator odbiera to jedno "chunkData"
+                yield $buffer;   // <-- the orchestrator receives this as one "chunkData"
                 $buffer = [];
             }
         }
 
         if ($buffer !== []) {
-            yield $buffer; // ostatnia, niepełna grupa
+            yield $buffer; // final, partial group
         }
 
         $reader->close();
@@ -92,10 +93,11 @@ class ImportProductFeedTask implements ChunkableTask, ShouldBufferPayloads
 }
 ```
 
-Ważne: `$xmlPath` i `$feedId` to jedyne właściwości obiektu — oba skalarne.
-Sam `XMLReader`/generator **nie jest** przechowywany jako property, więc
-kopiowanie tasku do callbacku (`BaseOrchestrator::taskWithoutBufferedPayloads()`)
-nie musi nic z niego usuwać poza samą kolekcją chunków.
+Important: `$xmlPath` and `$feedId` are the object's only properties — both
+scalar. The `XMLReader`/generator itself **is not** stored as a property, so
+copying the task for the callback
+(`BaseOrchestrator::taskWithoutBufferedPayloads()`) doesn't need to strip
+anything from it beyond the chunk collection itself.
 
 ## 2. Chunk job
 
@@ -120,7 +122,7 @@ class ImportProductChunkJob implements ShouldQueue
             return;
         }
 
-        // Ten sam kod działa niezależnie od tego, czy ShouldBufferPayloads jest włączone.
+        // The same code works whether ShouldBufferPayloads is enabled or not.
         $products = $this->resolvePayload($this->chunkData);
 
         foreach ($products as $product) {
@@ -130,7 +132,7 @@ class ImportProductChunkJob implements ShouldQueue
 }
 ```
 
-## 3. Merge/finalizacja job (reguła #4 z `AI_GUIDE.md` — NIE `Batchable`)
+## 3. Merge/finalization job (rule #4 from `AI_GUIDE.md` — NOT `Batchable`)
 
 ```php
 class MergeProductImportJob implements ShouldQueue
@@ -164,21 +166,21 @@ $batchId = app(BatchProcessOrchestrator::class)
 $feed->update(['batch_id' => $batchId]);
 ```
 
-## Co dokładnie dzieje się w pamięci
+## What exactly happens in memory
 
-- Plik XML: strumień, stała pamięć niezależna od rozmiaru pliku (`XMLReader`).
-- Każdy yield z generatora → natychmiast `Redis::setex()`, oryginalna grupa
-  200 produktów może zostać zwolniona przez GC zaraz po tym.
-- Chunk job trzyma tylko `BufferedPayloadReference` (klucz Redis + indeks) —
-  kilkadziesiąt bajtów, nie 200 rekordów produktowych.
-- Liczba chunk jobów w batchu = `ceil(liczba_produktów / 200)` — to
-  nieuniknione, `Bus::batch` musi znać total jobs (patrz
-  `docs/BUFFERED_PAYLOADS.md`, sekcja "Czego to NIE robi").
+- The XML file: a stream, constant memory regardless of file size (`XMLReader`).
+- Every generator yield → immediately `Redis::setex()`, the original group of
+  200 products can be freed by the GC right after.
+- The chunk job only holds a `BufferedPayloadReference` (a Redis key + index)
+  — a few dozen bytes, not 200 product records.
+- The number of chunk jobs in the batch = `ceil(product_count / 200)` — this
+  is unavoidable, `Bus::batch` must know the total job count (see
+  `docs/BUFFERED_PAYLOADS.md`, "What this does NOT do").
 
-## Konfiguracja TTL dla dużych importów
+## TTL configuration for large imports
 
-Jeśli import 500k produktów realistycznie trwa dłużej niż domyślne 4h TTL,
-podnieś `BATCH_ORCHESTRATOR_PAYLOAD_TTL` w `.env` albo nadpisz
-`payloadTtl()` bezpośrednio na `ImportProductFeedTask` (zamiast polegać na
-domyślnej implementacji z `BuffersPayloads`), żeby nie dzielić TTL z innymi
-taskami w aplikacji korzystającymi z domyślnego configu.
+If importing 500k products realistically takes longer than the default 4h
+TTL, raise `BATCH_ORCHESTRATOR_PAYLOAD_TTL` in `.env` or override
+`payloadTtl()` directly on `ImportProductFeedTask` (instead of relying on
+`BuffersPayloads`'s default implementation), so you don't share a TTL with
+other tasks in the application that use the default config.

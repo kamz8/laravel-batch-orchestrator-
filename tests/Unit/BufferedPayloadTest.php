@@ -2,10 +2,13 @@
 
 namespace Kamz8\BatchOrchestrator\Tests\Unit;
 
+use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Redis;
 use Kamz8\BatchOrchestrator\Concerns\BuffersPayloads;
 use Kamz8\BatchOrchestrator\Concerns\InteractsWithBufferedPayload;
 use Kamz8\BatchOrchestrator\Contracts\ShouldBufferPayloads;
+use Kamz8\BatchOrchestrator\Events\BufferedPayloadResolutionFailed;
+use Kamz8\BatchOrchestrator\Events\BufferedPayloadResolved;
 use Kamz8\BatchOrchestrator\Support\BufferedPayloadReference;
 use Kamz8\BatchOrchestrator\Tests\TestCase;
 use RuntimeException;
@@ -94,5 +97,70 @@ class BufferedPayloadTest extends TestCase
         // Supposing 14400 or another default is returned if config is empty.
         // Let's assert a sensible default like 14400 or whatever is set in the implementation (e.g. 14400).
         $this->assertSame(14400, $task->payloadTtl());
+    }
+
+    public function test_successful_resolution_dispatches_buffered_payload_resolved(): void
+    {
+        Event::fake([BufferedPayloadResolved::class, BufferedPayloadResolutionFailed::class]);
+
+        Redis::shouldReceive('get')
+            ->once()
+            ->with('batch-orchestrator:payload:some-key')
+            ->andReturn(serialize(['id' => 1]));
+
+        $reference = new BufferedPayloadReference('batch-orchestrator:payload:some-key', 'batch-key', 3);
+        $this->payloadResolver->resolve($reference);
+
+        Event::assertDispatchedTimes(BufferedPayloadResolved::class, 1);
+        Event::assertNotDispatched(BufferedPayloadResolutionFailed::class);
+        Event::assertDispatched(BufferedPayloadResolved::class, function (BufferedPayloadResolved $event) {
+            return $event->key === 'batch-orchestrator:payload:some-key'
+                && $event->batchKey === 'batch-key'
+                && $event->index === 3;
+        });
+    }
+
+    public function test_missing_key_dispatches_buffered_payload_resolution_failed_before_throwing(): void
+    {
+        Event::fake([BufferedPayloadResolved::class, BufferedPayloadResolutionFailed::class]);
+
+        Redis::shouldReceive('get')
+            ->once()
+            ->with('batch-orchestrator:payload:missing-key')
+            ->andReturn(null);
+
+        $reference = new BufferedPayloadReference('batch-orchestrator:payload:missing-key');
+
+        try {
+            $this->payloadResolver->resolve($reference);
+            $this->fail('Expected RuntimeException was not thrown.');
+        } catch (RuntimeException) {
+            // expected
+        }
+
+        Event::assertDispatchedTimes(BufferedPayloadResolutionFailed::class, 1);
+        Event::assertNotDispatched(BufferedPayloadResolved::class);
+    }
+
+    public function test_corrupt_payload_dispatches_buffered_payload_resolution_failed_before_throwing(): void
+    {
+        Event::fake([BufferedPayloadResolved::class, BufferedPayloadResolutionFailed::class]);
+
+        Redis::shouldReceive('get')
+            ->once()
+            ->with('batch-orchestrator:payload:corrupt-key')
+            ->andReturn('not-a-serialized-value');
+
+        $reference = new BufferedPayloadReference('batch-orchestrator:payload:corrupt-key');
+
+        try {
+            $this->payloadResolver->resolve($reference);
+            $this->fail('Expected RuntimeException was not thrown.');
+        } catch (RuntimeException) {
+            // expected
+        }
+
+        Event::assertDispatchedTimes(BufferedPayloadResolutionFailed::class, 1);
+        Event::assertNotDispatched(BufferedPayloadResolved::class);
     }
 }

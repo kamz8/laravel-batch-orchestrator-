@@ -1,22 +1,23 @@
-# Use case: generator bez `ShouldBufferPayloads`
+# Use case: a generator without `ShouldBufferPayloads`
 
-**Kiedy to wystarcza:** liczba chunków jest umiarkowana i **każdy pojedynczy
-chunk payload** jest mały (np. kilkadziesiąt/kilkaset ID-ków albo mały wycinek
-danych) — źródło samo w sobie może być duże (np. strumieniowe czytanie z
-bazy przez kursor), ale to, co trafia do kolejki na chunk job, jest lekkie.
+**When this is enough:** the number of chunks is moderate and **each
+individual chunk payload** is small (e.g. a few dozen/hundred IDs, or a small
+slice of data) — the source itself can be large (e.g. streamed reading from
+a database via a cursor), but what actually goes into the queue per chunk job
+is light.
 
-W takim wypadku generator w `getChunks()` sam wystarcza. Nie trzeba
-implementować `ShouldBufferPayloads` — payload chunk joba trafia bezpośrednio
-do tabeli `jobs`/`failed_jobs` tak jak przy zwykłej tablicy, po prostu bez
-budowania całej kolekcji chunków na starcie.
+In that case, a generator in `getChunks()` is enough by itself. There's no
+need to implement `ShouldBufferPayloads` — the chunk job's payload goes
+directly into the `jobs`/`failed_jobs` table just like with a plain array,
+just without building the whole chunk collection up front.
 
-**Kiedy NIE wystarcza (użyj `ShouldBufferPayloads`, patrz
-`docs/use-cases/streaming-xml-import.md`):** pojedynczy chunk sam w sobie jest
-ciężki (duże obiekty, długie stringi, zagnieżdżone struktury) — wtedy payload
-kolejki (SQS/Redis/database driver) rośnie proporcjonalnie i trzeba go
-odciążyć do Redis.
+**When it's NOT enough** (use `ShouldBufferPayloads`, see
+`docs/use-cases/streaming-xml-import.md`): a single chunk is itself heavy
+(large objects, long strings, nested structures) — then the queue payload
+(SQS/Redis/database driver) grows proportionally and needs to be offloaded to
+Redis.
 
-## Przykład: eksport ID-ków rekordów spełniających warunek
+## Example: exporting IDs of records matching a condition
 
 ```php
 use Kamz8\BatchOrchestrator\Contracts\ChunkableTask;
@@ -27,7 +28,7 @@ class ExportFilteredRecordsTask implements ChunkableTask
 
     public function __construct(
         private readonly int $exportId,
-        private readonly string $status, // skalar — bezpieczny do serializacji obiektu tasku
+        private readonly string $status, // scalar — safe to serialize the task object
     ) {}
 
     /**
@@ -37,8 +38,8 @@ class ExportFilteredRecordsTask implements ChunkableTask
     {
         $buffer = [];
 
-        // cursor() strumieniuje wiersze z bazy jeden po drugim,
-        // nigdy nie materializuje całego wyniku w pamięci
+        // cursor() streams rows from the database one at a time,
+        // never materializes the whole result set in memory
         foreach (Record::where('status', $this->status)->cursor() as $record) {
             $buffer[] = $record->id;
 
@@ -75,8 +76,8 @@ class ExportFilteredRecordsTask implements ChunkableTask
 }
 ```
 
-Chunk job odbiera surową tablicę ID-ków wprost — bez `InteractsWithBufferedPayload`,
-bo nie ma żadnej referencji do rozwiązywania:
+The chunk job receives the raw array of IDs directly — no
+`InteractsWithBufferedPayload`, since there's no reference to resolve:
 
 ```php
 class ExportRecordChunkJob implements ShouldQueue
@@ -92,20 +93,20 @@ class ExportRecordChunkJob implements ShouldQueue
         }
 
         Record::whereIn('id', $this->ids)->chunk(100, function ($records) {
-            // ... zapis do pliku eksportu, append-only
+            // ... write to the export file, append-only
         });
     }
 }
 ```
 
-## Reguła wyboru
+## Selection rule
 
-| Sytuacja | Rozwiązanie |
+| Situation | Solution |
 |---|---|
-| Źródło duże, ale pojedynczy chunk mały (ID-ki, krótkie skalary) | sam generator w `getChunks()`, bez `ShouldBufferPayloads` |
-| Źródło duże **i** pojedynczy chunk sam w sobie ciężki (sparsowane node'y XML, duże tablice zagnieżdżone) | generator + `ShouldBufferPayloads` (`docs/use-cases/streaming-xml-import.md`) |
-| Źródło małe (mieści się w pamięci bez problemu) | zwykła `array` z `getChunks()` — nie ma powodu komplikować |
+| Large source, but each chunk itself is small (IDs, short scalars) | a plain generator in `getChunks()`, without `ShouldBufferPayloads` |
+| Large source **and** each chunk itself is heavy (parsed XML nodes, large nested arrays) | generator + `ShouldBufferPayloads` (`docs/use-cases/streaming-xml-import.md`) |
+| Small source (comfortably fits in memory) | a plain `array` from `getChunks()` — no reason to complicate things |
 
-Więcej technicznych szczegółów o tym co dokładnie robi buforowanie i czego
-nie robi (np. że liczba jobów w batchu i tak jest równa liczbie chunków) —
-patrz `docs/BUFFERED_PAYLOADS.md`.
+For more technical detail on exactly what buffering does and doesn't do
+(e.g. that the number of jobs in the batch always equals the number of
+chunks) — see `docs/BUFFERED_PAYLOADS.md`.

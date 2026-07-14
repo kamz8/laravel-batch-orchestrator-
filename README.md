@@ -4,8 +4,10 @@ Dynamic chunking and orchestration of Laravel `Bus::batch()` for long-running jo
 
 ## Requirements
 
-- PHP `^8.2` or `^8.3`
-- Laravel `^10.0` or `^11.0` (`illuminate/bus`, `illuminate/support`)
+- PHP `^8.2`, `^8.3`, or `^8.4`
+- Laravel `^10.0`, `^11.0`, `^12.0`, or `^13.0` (`illuminate/bus`, `illuminate/support`)
+
+See [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) for the full PHP × Laravel support matrix and known exceptions.
 
 ## Installation
 
@@ -33,6 +35,17 @@ php artisan vendor:publish --tag=batch-orchestrator-config
 - `Concerns\HasBatchProgress` — trait for models that tracks percentage progress in Redis (chunks count toward 80%, the remainder is the merge stage).
 
 > Full API description (parameters, edge-case behavior) lives in the PHPDoc in `src/`. See [`docs/AI_GUIDE.md`](docs/AI_GUIDE.md) for a deeper guide on wiring up a new `ChunkableTask`.
+
+## Lifecycle events
+
+The package dispatches plain Laravel events (`Illuminate\Support\Facades\Event`)
+at key points of a batch's orchestration and its buffered-payload operations —
+`BatchOrchestrationStarted/Finished/Failed`, `BatchProgressUpdated`, and four
+`BufferedPayload*` events. It never broadcasts, queues, or registers listeners
+for them; that is entirely up to the consuming application (logging, custom
+domain broadcasts, UI updates, metrics). See
+[`docs/LIFECYCLE_EVENTS.md`](docs/LIFECYCLE_EVENTS.md) for the full emission
+order, an event table, and integration examples.
 
 ## Testing
 

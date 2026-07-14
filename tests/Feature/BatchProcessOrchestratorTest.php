@@ -83,8 +83,14 @@ class BatchProcessOrchestratorTest extends TestCase
     {
         $task = new FakeChunkableTask(chunks: [['id' => 1]], jobClass: FakeFailingChunkJob::class);
 
-        (new BatchProcessOrchestrator)->dispatch($task);
+        // Regression: on `queue.default=sync`, Illuminate\Bus\Batch::add() only
+        // swallows a chunk job's exception internally on Laravel 11 — Laravel
+        // 10/12/13 re-throw it after our ->catch() callback has already run.
+        // dispatch() must not let that framework-version-dependent exception
+        // escape; it must always return the batch ID, never throw here.
+        $batchId = (new BatchProcessOrchestrator)->dispatch($task);
 
+        $this->assertNotEmpty($batchId);
         $this->assertNotNull(FakeChunkableTask::$failureMessage);
         $this->assertStringContainsString('boom', FakeChunkableTask::$failureMessage);
         $this->assertNull(FakeChunkableTask::$finishedBatchId);
